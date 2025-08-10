@@ -5,8 +5,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 from fastapi.responses import HTMLResponse
 from typing import Dict, Any, List
-from openai import OpenAI
 import json
+import asyncio
+
+# Import the SimpleAgent class and required message types
+from langchain_core.messages import HumanMessage, SystemMessage
+from graph import SimpleAgent
 
 app = FastAPI()
 
@@ -37,27 +41,6 @@ def hello_world():
     </html>
     """)
 
-# @app.post("/api/chat_response")
-# def chat_response(data: Dict[str, Any] = Body(...)):
-#     """
-#     Endpoint to handle chat messages from frontend
-#     """
-#     user_message = data.get("message", "")
-#     attachment_name = data.get("attachment")
-
-#     client = OpenAI(base_url="http://localhost:11434/v1", api_key="nothing")
-
-#     response = client.chat.completions.create(
-#         model="gemma3:1b",
-#         messages=[
-#             {"role": "system", "content": "You are a helpful assistant."},
-#             {"role": "user", "content": user_message}
-#         ]
-#     )
-#     final_response = response.choices[0].message.content
-
-#     return JSONResponse({"response": final_response})
-
 # Connection manager for WebSockets
 class ConnectionManager:
     def __init__(self):
@@ -79,15 +62,16 @@ manager = ConnectionManager()
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
+        # Initialize SimpleAgent once
+        agent = SimpleAgent(mode='local', llm_model=None, tools=[])
+        config = {"configurable": {"thread_id": "5"}}
+        
         while True:
             # Wait for messages from the client
             data = await websocket.receive_text()
             data_json = json.loads(data)
             user_message = data_json.get("message", "")
             attachment_name = data_json.get("attachment")
-            
-            # Initialize OpenAI client
-            client = OpenAI(base_url="http://localhost:11434/v1", api_key="nothing")
             
             try:
                 # Start streaming response
@@ -96,35 +80,39 @@ async def websocket_endpoint(websocket: WebSocket):
                     websocket
                 )
                 
-                # Stream the LLM response with enhanced system prompt for markdown formatting
-                stream = client.chat.completions.create(
-                    model="gemma3:1b",
-                    messages=[
-                        {"role": "system", "content": """You are a helpful assistant that provides well-formatted responses.
-                        
-                            Format your responses using Markdown:
-                            1. Use # ## ### for headings
-                            2. Use **bold** and *italic* for emphasis
-                            3. Use `code` for inline code and ```language for code blocks
-                            4. Use - or * for bullet points
-                            5. Use 1. 2. 3. for numbered lists
-                            6. Organize complex information into sections with headings
-                            7. Use paragraphs to separate topics (leave blank line)
+                # Create system message and human message
+                system_message = SystemMessage(content="""You are a helpful assistant that provides well-formatted responses.
+                    
+                    Format your responses using Markdown:
+                    1. Use # ## ### for headings
+                    2. Use **bold** and *italic* for emphasis
+                    3. Use `code` for inline code and ```language for code blocks
+                    4. Use - or * for bullet points
+                    5. Use 1. 2. 3. for numbered lists
+                    6. Organize complex information into sections with headings
+                    7. Use paragraphs to separate topics (leave blank line)
 
-                            Always format code snippets properly with code blocks."""},
-                        {"role": "user", "content": user_message}
-                    ],
-                    stream=True  # Enable streaming
-                )
+                    Always format code snippets properly with code blocks.""")
+                input_message = HumanMessage(content=user_message)
                 
-                # Send each chunk as it arrives
-                for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        await manager.send_personal_message(
-                            json.dumps({"type": "chunk", "content": content}),
-                            websocket
-                        )
+                # Stream the response using langgraph
+                content_buffer = ""
+                async for event in agent.graph.astream_events(
+                    {"messages": [system_message, input_message]}, 
+                    config, 
+                    version="v2"
+                ):
+                    # Get chat model tokens from the assistant node
+                    if event["event"] == "on_chat_model_stream" and event['metadata'].get('langgraph_node', '') == "assistant":
+                        if "data" in event and "chunk" in event["data"]:
+                            content = event["data"]["chunk"].content
+                            if content:
+                                content_buffer += content
+                                # Send each chunk as it arrives
+                                await manager.send_personal_message(
+                                    json.dumps({"type": "chunk", "content": content}),
+                                    websocket
+                                )
                 
                 # Send completion message
                 await manager.send_personal_message(
